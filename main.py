@@ -3,6 +3,7 @@ import logging
 import uuid
 import re
 import sqlite3
+import os
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -17,17 +18,24 @@ from aiogram.exceptions import TelegramBadRequest
 # ==========================================
 # НАСТРОЙКИ БОТА
 # ==========================================
-BOT_TOKEN = "8800473241:AAHi1rMUvnoQpF8jC8NSgGpoWKHTl8wPovI"  # <-- Вставьте токен
+# Токен будет браться из переменных окружения Railway (или вставьте сюда вручную)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "ВАШ_ТОКЕН_ЕСЛИ_ЗАПУСКАЕТЕ_ЛОКАЛЬНО") 
 ADMIN_USERNAME = "chingiz_trader"      # <-- Ваш юзернейм (без @)
+
+# Путь для базы данных (для Railway Volume)
+DB_PATH = '/app/data/bot_database.db'
 
 def is_admin(user):
     return user.username and user.username.lower() == ADMIN_USERNAME.lower()
 
 # ==========================================
-# БАЗА ДАННЫХ
+# БАЗА ДАННЫХ (SQLite)
 # ==========================================
 def init_db():
-    conn = sqlite3.connect('bot_database.db')
+    # Создаем папку, если ее нет (нужно для Railway)
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY, username TEXT, profit INTEGER DEFAULT 0, access_until TEXT
@@ -39,7 +47,7 @@ def init_db():
     conn.close()
 
 def get_user(user_id):
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT profit, access_until FROM users WHERE user_id = ?", (user_id,))
     row = cursor.fetchone()
@@ -47,40 +55,51 @@ def get_user(user_id):
     return row if row else (0, None)
 
 def add_user(user_id, username):
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
     conn.commit()
     conn.close()
 
 def add_profit(user_id):
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("UPDATE users SET profit = profit + 1 WHERE user_id = ?", (user_id,))
     conn.commit()
     conn.close()
 
 def set_access(user_id, days):
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    
+    cursor.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, "user"))
+    
+    days = int(days)
     if days == 9999:
         new_date = "2099-12-31 23:59:59"
     else:
         cursor.execute("SELECT access_until FROM users WHERE user_id = ?", (user_id,))
         current = cursor.fetchone()[0]
         now = datetime.now()
-        if current and datetime.strptime(current, "%Y-%m-%d %H:%M:%S") > now:
-            base_date = datetime.strptime(current, "%Y-%m-%d %H:%M:%S")
+        
+        if current and current != "None":
+            try:
+                current_dt = datetime.strptime(current, "%Y-%m-%d %H:%M:%S")
+                base_date = current_dt if current_dt > now else now
+            except ValueError:
+                base_date = now
         else:
             base_date = now
+            
         new_date = (base_date + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        
     cursor.execute("UPDATE users SET access_until = ? WHERE user_id = ?", (new_date, user_id))
     conn.commit()
     conn.close()
 
 def create_promo(days):
     code = "PRO-" + str(uuid.uuid4())[:6].upper()
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("INSERT INTO promos (code, days) VALUES (?, ?)", (code, days))
     conn.commit()
@@ -88,16 +107,18 @@ def create_promo(days):
     return code
 
 def use_promo(user_id, code):
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT days, is_used FROM promos WHERE code = ?", (code,))
     row = cursor.fetchone()
+    
     if not row:
         conn.close()
         return False, "❌ Промокод не найден."
     if row[1] == 1:
         conn.close()
         return False, "❌ Этот промокод уже был использован."
+        
     set_access(user_id, row[0])
     cursor.execute("UPDATE promos SET is_used = 1 WHERE code = ?", (code,))
     conn.commit()
@@ -105,7 +126,7 @@ def use_promo(user_id, code):
     return True, row[0]
 
 def get_stats():
-    conn = sqlite3.connect('bot_database.db')
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM users")
     total_users = cursor.fetchone()[0]
@@ -182,28 +203,20 @@ def get_main_kb():
 # УНИВЕРСАЛЬНОЕ РЕДАКТИРОВАНИЕ СООБЩЕНИЙ
 # ==========================================
 async def edit_offer_message(callback: CallbackQuery, text: str, reply_markup=None):
-    """Правильно редактирует сообщение, будь то инлайн-режим или бизнес-чат"""
     try:
         if callback.inline_message_id:
-            # Если это инлайн-сообщение (через @Бот код)
             await bot.edit_message_text(
                 inline_message_id=callback.inline_message_id,
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode="HTML"
+                text=text, reply_markup=reply_markup, parse_mode="HTML"
             )
         else:
-            # Если это обычное сообщение в бизнес-чате
             await bot.edit_message_text(
-                chat_id=callback.message.chat.id,
-                message_id=callback.message.message_id,
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode="HTML",
+                chat_id=callback.message.chat.id, message_id=callback.message.message_id,
+                text=text, reply_markup=reply_markup, parse_mode="HTML",
                 business_connection_id=callback.message.business_connection_id
             )
     except TelegramBadRequest as e:
-        print(f"⚠️ Ошибка редактирования (возможно, сообщение уже изменено): {e}")
+        print(f"⚠️ Ошибка редактирования: {e}")
 
 # ==========================================
 # ХЭНДЛЕРЫ
@@ -220,12 +233,15 @@ async def show_profile(message: Message):
     profit, access_until = get_user(user_id)
     is_premium = "Да ✅" if message.from_user.is_premium else "Нет ❌"
     
-    if access_until:
+    if access_until and access_until != "None":
         if access_until == "2099-12-31 23:59:59":
             access_text = "Навсегда ♾️"
         else:
-            dt = datetime.strptime(access_until, "%Y-%m-%d %H:%M:%S")
-            access_text = "Истек ❌" if dt < datetime.now() else f"До {dt.strftime('%d.%m.%Y %H:%M')} 📅"
+            try:
+                dt = datetime.strptime(access_until, "%Y-%m-%d %H:%M:%S")
+                access_text = "Истек ❌" if dt < datetime.now() else f"До {dt.strftime('%d.%m.%Y %H:%M')} 📅"
+            except ValueError:
+                access_text = "Ошибка базы данных ❌"
     else:
         access_text = "Нет доступа ❌"
 
@@ -281,9 +297,12 @@ async def show_stats(callback: CallbackQuery):
 def check_access(user):
     if is_admin(user): return True
     _, access_until = get_user(user.id)
-    if not access_until: return False
+    if not access_until or access_until == "None": return False
     if access_until == "2099-12-31 23:59:59": return True
-    return datetime.strptime(access_until, "%Y-%m-%d %H:%M:%S") > datetime.now()
+    try:
+        return datetime.strptime(access_until, "%Y-%m-%d %H:%M:%S") > datetime.now()
+    except ValueError:
+        return False
 
 async def create_offer_logic(message: Message, is_business: bool):
     if not check_access(message.from_user):
@@ -343,9 +362,6 @@ async def handle_inline_query(inline_query: InlineQuery):
     ]])
     await inline_query.answer([InlineQueryResultArticle(id=inline_query.query.strip(), title="Оффер", input_message_content=InputTextMessageContent(message_text=offer_text, parse_mode="HTML"), reply_markup=kb)], cache_time=0, is_personal=True)
 
-# ==========================================
-# КНОПКИ (ИСПОЛЬЗУЕМ УНИВЕРСАЛЬНУЮ ФУНКЦИЮ)
-# ==========================================
 @dp.callback_query(F.data.startswith('decline_'))
 async def decline_offer(callback: CallbackQuery):
     offer_id = callback.data.split('_')[1]
@@ -354,8 +370,7 @@ async def decline_offer(callback: CallbackQuery):
 
     t = TEXTS[data['lang']]
     text = t['rejected'].format(price=data['price'], currency_icon=data['currency_icon'], gift_name=data['gift_name'])
-    
-    await edit_offer_message(callback, text, reply_markup=None) # <--- Используем новую функцию
+    await edit_offer_message(callback, text, reply_markup=None)
     active_offers.pop(offer_id, None)
     await callback.answer()
 
@@ -371,14 +386,12 @@ async def accept_offer(callback: CallbackQuery):
     target = f"@{data['seller_username']}" if data['seller_username'] else data['seller_name']
     url = f"https://t.me/{data['seller_username']}" if data['seller_username'] else f"tg://user?id={data['seller_id']}"
 
-    # 1. Показываем окошко
     await callback.answer(text=t['alert'].format(target=target), show_alert=True)
     
-    # 2. Редактируем сообщение на "Продано"
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t['btn_transfer'], url=url)]])
     text = t['sold'].format(gift_name=data['gift_name'], target=target, currency_icon=data['currency_icon'])
     
-    await edit_offer_message(callback, text, reply_markup=kb) # <--- Используем новую функцию
+    await edit_offer_message(callback, text, reply_markup=kb)
     active_offers.pop(offer_id, None)
 
 # ==========================================
@@ -387,7 +400,7 @@ async def accept_offer(callback: CallbackQuery):
 async def main():
     init_db()
     logging.basicConfig(level=logging.INFO)
-    print("Бот запущен...")
+    print("Бот запущен и готов к работе...")
     await dp.start_polling(bot, allowed_updates=["message", "business_connection", "business_message", "callback_query", "inline_query"])
 
 if __name__ == "__main__":
